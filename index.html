@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>InkSocial - Ink Network Social</title>
+    <meta name="theme-color" content="#121118" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="./styles/ink-theme.css" />
+    <link rel="stylesheet" href="./styles/app.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "phaser": "https://esm.sh/phaser@3.70.0",
+          "lucide": "https://esm.sh/lucide@0.344.0",
+          "ethers": "https://esm.sh/ethers@6.11.1",
+          "viem": "https://esm.sh/viem@2.x",
+          "lightweight-charts": "https://esm.sh/lightweight-charts@4.1.1"
+        }
+      }
+    </script>
+  </head>
+  <body class="ink-app min-h-screen">
+    <div id="app" class="ink-shell">
+      <!-- Loading State -->
+      <div id="loading" class="flex-1 flex items-center justify-center">
+        <div class="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-indigo-500"></div>
+      </div>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+    <!-- Rosebud specific helper scripts -->
+    <script src="https://storage.googleapis.com/rosebud_staticfiles/ProgressLogger.js"></script>
+  </body>
+</html>
