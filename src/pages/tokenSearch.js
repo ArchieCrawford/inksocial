@@ -55,7 +55,8 @@ export const renderTokenSearch = (container) => {
         searchResults: [],
         cursor: '',
         hasMore: true,
-        isLoading: false
+        isLoading: false,
+        didFallback: false
     };
 
     const { wrapper: searchWrapper, status, input } = createTokenSearchInput({
@@ -131,6 +132,26 @@ export const renderTokenSearch = (container) => {
                     cursor: listState.cursor
                 });
             const items = result.items || [];
+            if (
+                modeState.value === 'trending' &&
+                items.length === 0 &&
+                listState.tokens.length === 0 &&
+                !listState.didFallback
+            ) {
+                listState.didFallback = true;
+                modeState.value = 'recent';
+                renderModeTabs();
+                resetList();
+                status.textContent = copy.tokens.noTrending;
+                ToastService.show({
+                    title: copy.tokens.tabs.trending,
+                    message: copy.tokens.noTrending,
+                    type: 'info'
+                });
+                listState.isLoading = false;
+                loadMore();
+                return;
+            }
             listState.tokens = listState.tokens.concat(items);
             listState.cursor = result.nextCursor || '';
             listState.hasMore = Boolean(listState.cursor);

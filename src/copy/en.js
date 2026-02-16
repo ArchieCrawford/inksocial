@@ -67,6 +67,7 @@ export const copy = {
         loading: 'Loading tokens...',
         searching: 'Searching...',
         error: 'Unable to search tokens right now.',
+        noTrending: 'No trending data yet. Showing recent tokens.',
         verified: 'Verified',
         select: 'Select token',
         view: 'View',

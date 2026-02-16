@@ -17,6 +17,9 @@ const {
   listRecent
 } = require('./lib/tokens');
 const { syncTokens } = require('./jobs/syncTokens');
+const { syncMarketData, syncPriceHistory } = require('./jobs/syncMarketData');
+const { computeTrendingRanks } = require('./jobs/computeTrending');
+const { syncNames } = require('./jobs/resolveNamesBatch');
 const { fetchProfile, updateProfile, upsertUser } = require('./lib/profile');
 const { uploadPublicObject } = require('./lib/storage');
 const { resolveInkName } = require('./lib/nameResolver');
@@ -624,6 +627,56 @@ const server = http.createServer(async (req, res) => {
     try {
       const result = await syncTokens();
       sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, { error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/admin/jobs/run') {
+    const adminKey = process.env.ADMIN_API_KEY;
+    const providedKey = readAdminKey(req);
+
+    if (!adminKey || providedKey !== adminKey) {
+      sendJson(res, 401, { error: 'Unauthorized' });
+      return;
+    }
+
+    const body = await parseJsonBody(req);
+    const job = String(body?.job || '').toLowerCase();
+
+    const jobs = {
+      tokens: async () => syncTokens(),
+      market: async () => syncMarketData(),
+      ohlcv: async () => syncPriceHistory(),
+      trending: async () => computeTrendingRanks(),
+      names: async () => syncNames()
+    };
+
+    if (job === 'all') {
+      try {
+        const results = {
+          tokens: await jobs.tokens(),
+          market: await jobs.market(),
+          ohlcv: await jobs.ohlcv(),
+          trending: await jobs.trending(),
+          names: await jobs.names()
+        };
+        sendJson(res, 200, { ok: true, results });
+      } catch (error) {
+        sendJson(res, 500, { error: error.message });
+      }
+      return;
+    }
+
+    if (!jobs[job]) {
+      sendJson(res, 400, { error: 'Unknown job. Use tokens, market, ohlcv, trending, names, or all.' });
+      return;
+    }
+
+    try {
+      const result = await jobs[job]();
+      sendJson(res, 200, { ok: true, job, result });
     } catch (error) {
       sendJson(res, 500, { error: error.message });
     }
