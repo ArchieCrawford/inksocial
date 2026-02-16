@@ -8,10 +8,43 @@ const HISTORY_TTL_MINUTES = Number(process.env.MARKET_HISTORY_TTL_MINUTES || 60)
 const BATCH_SIZE = Number(process.env.CMC_BATCH_SIZE || 100);
 const HISTORY_POINTS = Number(process.env.CMC_HISTORY_POINTS || 168);
 const HISTORY_TOKEN_LIMIT = Number(process.env.CMC_HISTORY_TOKEN_LIMIT || 50);
+let ohlcvDisabled = false;
+const INKYSWAP_BASE = process.env.INKYSWAP_API_BASE || 'https://inkyswap.com';
+const USE_INKYSWAP_MARKET = process.env.USE_INKYSWAP_MARKET === 'true';
+const STABLE_SYMBOLS = new Set(
+  (process.env.INKYSWAP_STABLE_SYMBOLS || 'USDC,USDT,DAI,USDG,USDB')
+    .split(',')
+    .map((value) => value.trim().toUpperCase())
+    .filter(Boolean)
+);
+const STABLE_ADDRESSES = new Set(
+  (process.env.INKYSWAP_STABLE_ADDRESSES || '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 const normalizeSymbol = (symbol) => (symbol ? String(symbol).trim().toUpperCase() : null);
 const isValidCmcSymbol = (symbol) => Boolean(symbol && /^[A-Z0-9]+$/.test(symbol));
 const normalizeAddress = (address) => (address ? String(address).toLowerCase() : null);
+const toNumber = (value) => {
+  if (value === null || value === undefined) return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+const toDecimal = (raw, decimals) => {
+  const num = toNumber(raw);
+  if (num === null) return null;
+  const scale = Number.isFinite(decimals) ? Number(decimals) : 18;
+  return num / Math.pow(10, scale);
+};
+
+const isStableToken = ({ address, symbol } = {}) => {
+  if (address && STABLE_ADDRESSES.has(address)) return true;
+  if (symbol && STABLE_SYMBOLS.has(symbol)) return true;
+  return false;
+};
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -56,11 +89,117 @@ const cmcRequest = async (path, params = {}) => {
       url.searchParams.set(key, String(value));
     }
   });
-  return fetchWithRetry(url.toString(), {
-    headers: {
-      'X-CMC_PRO_API_KEY': CMC_API_KEY
+  try {
+    return await fetchWithRetry(url.toString(), {
+      headers: {
+        'X-CMC_PRO_API_KEY': CMC_API_KEY
+      }
+    });
+  } catch (error) {
+    if (error?.status === 400 && /Invalid values for \"symbol\"/i.test(error.message || '')) {
+      console.warn('[syncMarketData] CMC symbol batch rejected, skipping batch.');
+      return { data: {} };
+    }
+    throw error;
+  }
+};
+
+const fetchInkySwapPairs = async () => {
+  const url = new URL('/api/pairs', INKYSWAP_BASE);
+  const response = await fetch(url.toString());
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`InkySwap pairs fetch failed: ${response.status} ${text}`);
+  }
+  const data = await response.json();
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.items)) return data.items;
+  return [];
+};
+
+const buildInkySwapSnapshot = (pairs, tokens = []) => {
+  const tokenMeta = new Map(
+    tokens.map((token) => [normalizeAddress(token.address), {
+      address: normalizeAddress(token.address),
+      symbol: normalizeSymbol(token.symbol),
+      decimals: Number.isFinite(token.decimals) ? Number(token.decimals) : null,
+      logo_url: token.logo_url
+    }])
+  );
+
+  const priceMap = new Map();
+  const volumeMap = new Map();
+  const pairEntries = [];
+
+  const mergeMeta = (pairToken) => {
+    if (!pairToken) return null;
+    const address = normalizeAddress(pairToken.address);
+    if (!address) return null;
+    const base = tokenMeta.get(address) || {};
+    return {
+      address,
+      symbol: normalizeSymbol(pairToken.symbol || base.symbol),
+      decimals: Number.isFinite(pairToken.decimals) ? Number(pairToken.decimals) : base.decimals ?? 18
+    };
+  };
+
+  tokens.forEach((token) => {
+    const address = normalizeAddress(token.address);
+    if (!address) return;
+    const symbol = normalizeSymbol(token.symbol);
+    if (isStableToken({ address, symbol })) {
+      priceMap.set(address, 1);
     }
   });
+
+  for (const pair of pairs) {
+    const token0 = mergeMeta(pair.token0);
+    const token1 = mergeMeta(pair.token1);
+    if (!token0?.address || !token1?.address) continue;
+
+    if (isStableToken(token0)) priceMap.set(token0.address, 1);
+    if (isStableToken(token1)) priceMap.set(token1.address, 1);
+
+    const reserve0 = toDecimal(pair.reserve0, token0.decimals);
+    const reserve1 = toDecimal(pair.reserve1, token1.decimals);
+    if (!reserve0 || !reserve1) continue;
+
+    pairEntries.push({ token0, token1, reserve0, reserve1 });
+
+    const volumeUsd = toNumber(pair.volume_24h) || 0;
+    if (volumeUsd > 0) {
+      volumeMap.set(token0.address, (volumeMap.get(token0.address) || 0) + volumeUsd);
+      volumeMap.set(token1.address, (volumeMap.get(token1.address) || 0) + volumeUsd);
+    }
+  }
+
+  for (let i = 0; i < 5; i += 1) {
+    let changed = false;
+    for (const entry of pairEntries) {
+      const price0 = priceMap.get(entry.token0.address);
+      const price1 = priceMap.get(entry.token1.address);
+
+      if (price0 == null && price1 != null) {
+        const next = price1 * (entry.reserve1 / entry.reserve0);
+        if (Number.isFinite(next)) {
+          priceMap.set(entry.token0.address, next);
+          changed = true;
+        }
+      }
+
+      if (price1 == null && price0 != null) {
+        const next = price0 * (entry.reserve0 / entry.reserve1);
+        if (Number.isFinite(next)) {
+          priceMap.set(entry.token1.address, next);
+          changed = true;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+
+  return { priceMap, volumeMap, pairCount: pairEntries.length };
 };
 
 const chunkArray = (items, size) => {
@@ -170,6 +309,48 @@ const buildMarketUpdates = (tokens, quoteData, infoData) => {
   return updates;
 };
 
+const syncMarketDataFromInkySwap = async ({ tokens, marketMap }) => {
+  const pairs = await fetchInkySwapPairs();
+  const { priceMap, volumeMap } = buildInkySwapSnapshot(pairs, tokens);
+  const now = new Date().toISOString();
+  const updates = [];
+
+  for (const token of tokens) {
+    const address = normalizeAddress(token.address);
+    if (!address) continue;
+    const existing = marketMap.get(address);
+    if (existing && !isStale(existing.last_updated, MARKET_TTL_MINUTES)) {
+      continue;
+    }
+    const price = priceMap.get(address);
+    const volume = volumeMap.get(address);
+    if (price == null && volume == null) continue;
+
+    updates.push({
+      chain_id: DEFAULT_CHAIN_ID,
+      token_address: address,
+      price_usd: price ?? null,
+      market_cap: null,
+      volume_24h: volume ?? null,
+      percent_change_24h: null,
+      logo_url: token.logo_url || null,
+      last_updated: now,
+      source: 'inkyswap'
+    });
+  }
+
+  if (updates.length > 0) {
+    await upsertMarketData(updates);
+  }
+
+  return {
+    updated: updates.length,
+    skipped: tokens.length - updates.length,
+    source: 'inkyswap',
+    pairs: pairs.length
+  };
+};
+
 const syncMarketData = async () => {
   const tokens = await fetchTokens();
   const addresses = tokens.map((token) => normalizeAddress(token.address));
@@ -182,6 +363,10 @@ const syncMarketData = async () => {
     return !entry || isStale(entry.last_updated, MARKET_TTL_MINUTES);
   });
 
+  if (USE_INKYSWAP_MARKET || !CMC_API_KEY) {
+    return syncMarketDataFromInkySwap({ tokens, marketMap });
+  }
+
   const symbols = Array.from(
     new Set(
       staleTokens
@@ -191,27 +376,39 @@ const syncMarketData = async () => {
   );
 
   if (symbols.length === 0) {
-    return { updated: 0, skipped: tokens.length };
+    return syncMarketDataFromInkySwap({ tokens, marketMap });
   }
 
   const batches = chunkArray(symbols, BATCH_SIZE);
   let updated = 0;
 
-  for (const batch of batches) {
-    const symbolList = batch.join(',');
-    const [quotes, info] = await Promise.all([
-      cmcRequest('/v1/cryptocurrency/quotes/latest', { symbol: symbolList, convert: 'USD' }),
-      cmcRequest('/v1/cryptocurrency/info', { symbol: symbolList })
-    ]);
+  try {
+    for (const batch of batches) {
+      const symbolList = batch.join(',');
+      const [quotes, info] = await Promise.all([
+        cmcRequest('/v1/cryptocurrency/quotes/latest', { symbol: symbolList, convert: 'USD' }),
+        cmcRequest('/v1/cryptocurrency/info', { symbol: symbolList })
+      ]);
 
-    const updates = buildMarketUpdates(staleTokens, quotes?.data || {}, info?.data || {});
-    if (updates.length > 0) {
-      await upsertMarketData(updates);
-      updated += updates.length;
+      const updates = buildMarketUpdates(staleTokens, quotes?.data || {}, info?.data || {});
+      if (updates.length > 0) {
+        await upsertMarketData(updates);
+        updated += updates.length;
+      }
     }
+  } catch (error) {
+    if (error?.status === 403) {
+      console.warn('[syncMarketData] CMC plan does not allow market data. Falling back to InkySwap.');
+      return syncMarketDataFromInkySwap({ tokens, marketMap });
+    }
+    throw error;
   }
 
-  return { updated, skipped: tokens.length - updated };
+  if (updated === 0) {
+    return syncMarketDataFromInkySwap({ tokens, marketMap });
+  }
+
+  return { updated, skipped: tokens.length - updated, source: 'coinmarketcap' };
 };
 
 const fetchHistoryTargets = async () => {
@@ -248,12 +445,23 @@ const fetchLatestHistoryTimestamp = async (address) => {
 };
 
 const fetchOhlcv = async (symbol) => {
-  const response = await cmcRequest('/v1/cryptocurrency/ohlcv/historical', {
-    symbol,
-    convert: 'USD',
-    interval: 'hourly',
-    count: HISTORY_POINTS
-  });
+  if (ohlcvDisabled) return [];
+  let response;
+  try {
+    response = await cmcRequest('/v1/cryptocurrency/ohlcv/historical', {
+      symbol,
+      convert: 'USD',
+      interval: 'hourly',
+      count: HISTORY_POINTS
+    });
+  } catch (error) {
+    if (error?.status === 403) {
+      ohlcvDisabled = true;
+      console.warn('[syncMarketData] CMC OHLCV not permitted by plan. Skipping history sync.');
+      return [];
+    }
+    throw error;
+  }
 
   const entry = response?.data?.[symbol] || response?.data || null;
   const quotes = entry?.quotes || entry?.data?.quotes || [];
@@ -270,7 +478,51 @@ const fetchOhlcv = async (symbol) => {
   });
 };
 
+const syncPriceHistoryFromInkySwap = async () => {
+  const tokens = await fetchTokens();
+  const pairs = await fetchInkySwapPairs();
+  const { priceMap, volumeMap } = buildInkySwapSnapshot(pairs, tokens);
+  const now = new Date().toISOString();
+  const entries = [];
+  let skipped = 0;
+
+  for (const token of tokens) {
+    const address = normalizeAddress(token.address);
+    if (!address) continue;
+    const price = priceMap.get(address);
+    if (price == null) {
+      skipped += 1;
+      continue;
+    }
+    const lastTimestamp = await fetchLatestHistoryTimestamp(address);
+    if (lastTimestamp && !isStale(lastTimestamp, HISTORY_TTL_MINUTES)) {
+      skipped += 1;
+      continue;
+    }
+    entries.push({
+      chain_id: DEFAULT_CHAIN_ID,
+      token_address: address,
+      timestamp: now,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+      volume: volumeMap.get(address) ?? null
+    });
+  }
+
+  if (entries.length > 0) {
+    await upsertPriceHistory(entries);
+  }
+
+  return { tokens: tokens.length, upserted: entries.length, skipped, source: 'inkyswap' };
+};
+
 const syncPriceHistory = async () => {
+  if (USE_INKYSWAP_MARKET || !CMC_API_KEY) {
+    return syncPriceHistoryFromInkySwap();
+  }
+
   const targets = await fetchHistoryTargets();
   let upserted = 0;
   let skipped = 0;
@@ -283,6 +535,9 @@ const syncPriceHistory = async () => {
     }
 
     const quotes = await fetchOhlcv(target.symbol);
+    if (ohlcvDisabled) {
+      return syncPriceHistoryFromInkySwap();
+    }
     const entries = quotes
       .filter((quote) => quote.timestamp)
       .map((quote) => ({

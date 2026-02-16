@@ -1,7 +1,12 @@
 const { upsertTokens } = require('../lib/supabase');
 
 const DEFAULT_CHAIN_ID = Number(process.env.INK_CHAIN_ID || 57073);
-const BLOCKSCOUT_BASE = process.env.INK_BLOCKSCOUT_API_BASE || process.env.BLOCKSCOUT_BASE_URL;
+const resolveBlockscoutBase = () => {
+  const preferred = process.env.INK_BLOCKSCOUT_API_BASE;
+  if (preferred && /^https?:\/\//i.test(preferred)) return preferred;
+  return process.env.BLOCKSCOUT_BASE_URL;
+};
+const BLOCKSCOUT_BASE = resolveBlockscoutBase();
 const SAFE_TX_BASE = process.env.SAFE_TX_SERVICE_BASE;
 const INK_API_KEY = process.env.INK_API_KEY;
 const INKYSWAP_BASE = process.env.INKYSWAP_API_BASE || 'https://inkyswap.com';
